@@ -12,4 +12,6 @@ set -uo pipefail
 INPUT=$(cat)
 : "${INPUT:=}"  # silence unused-var warnings in stricter environments
 
-echo "Session started at $(date -Iseconds)."
+# Portable ISO-8601: %Y-%m-%dT%H:%M:%S%z works on both GNU and BSD date.
+# GNU's `date -Iseconds` is not available on macOS.
+echo "Session started at $(date '+%Y-%m-%dT%H:%M:%S%z')."

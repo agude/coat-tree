@@ -2,8 +2,11 @@ name: ci
 
 on:
   push:
-    branches: [main]
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   shellcheck:
@@ -31,5 +34,20 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install bats-core jq
+      - name: Run bats suite
+        run: bats tests/
+
+  bash-3-2:
+    # Runs the full bats suite under Bash 3.2 (the macOS system bash).
+    # The macos-latest job above uses brew's modern Bash via
+    # #!/usr/bin/env bash, so it doesn't catch 3.2-vs-5.x divergence.
+    # This container does.
+    runs-on: ubuntu-latest
+    container:
+      image: bash:3.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: apk add --no-cache bats jq
       - name: Run bats suite
         run: bats tests/
