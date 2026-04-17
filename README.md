@@ -26,31 +26,12 @@ Each hook checks one thing. The dispatcher composes them.
 
 ## Install
 
-### Manual
-
 ```bash
 git clone https://github.com/agude/coat-tree.git ~/.local/share/coat-tree
 ln -s ~/.local/share/coat-tree/dispatch.sh ~/.local/bin/coat-tree
 ```
 
 Make sure `~/.local/bin` is on your `PATH`.
-
-### Ansible
-
-```yaml
-- name: Clone coat-tree
-  ansible.builtin.git:
-    repo: https://github.com/agude/coat-tree.git
-    dest: "{{ ansible_env.HOME }}/.local/share/coat-tree"
-    version: main
-
-- name: Symlink coat-tree onto PATH
-  ansible.builtin.file:
-    src: "{{ ansible_env.HOME }}/.local/share/coat-tree/dispatch.sh"
-    dest: "{{ ansible_env.HOME }}/.local/bin/coat-tree"
-    state: link
-    force: true
-```
 
 ## Configure Claude Code
 
@@ -75,6 +56,10 @@ matching `hooks.d/<EventName>/` directory, so one command entry covers
 every event.
 
 ## Write hooks
+
+See [`examples/`](examples/) for runnable hook scripts covering the
+common patterns: a non-tool event, a `PreToolUse` deny with a matcher
+header, and a file-path-aware `ask` decision.
 
 See [HOOKS.md](HOOKS.md) for:
 
