@@ -81,6 +81,21 @@ Execution is also logged to syslog under the `coat-tree` tag:
 journalctl -t coat-tree
 ```
 
+## Testing
+
+Tests use [bats](https://github.com/bats-core/bats-core). Install it
+(`apt install bats` or `brew install bats-core`), then:
+
+```bash
+bats tests/
+```
+
+`tests/dispatch.bats` covers dispatcher behavior against synthetic
+hooks in a temp directory. `tests/examples.bats` smoke-tests the
+shipped `examples/` by feeding event JSON through the dispatcher with
+`COAT_TREE_DIR` pointed at `examples/`. CI runs both on Ubuntu and
+macOS.
+
 ## License
 
 [CC0 1.0 Universal](LICENSE). Public domain — do what you want.
