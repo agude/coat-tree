@@ -2,29 +2,15 @@
 
 ## When to use hooks vs. settings
 
-Hooks and permission rules in `settings.json` serve different purposes.
-Use the right tool for the job:
+Permission rules in `settings.json` match command prefixes. They're
+static, fast, and can't inspect full arguments. Hooks parse the entire
+event JSON and decide dynamically.
 
-| Situation | Mechanism | Example |
-|-----------|-----------|---------|
-| **Always safe** | `allow` in settings | `git log`, `ls`, `gh pr list` |
-| **Never safe** | `deny` in settings | `sudo`, `reboot`, `dd` |
-| **Nuanced** | Hook decides | `git push` (ok to feature, not to main) |
-| **Dangerous, hard to filter** | Hook as smart filter | `gh` subcommands (many safe, some destructive) |
-
-The `ask: *` rule in settings is the universal backstop. Any command not
-explicitly allowed by a rule or hook still prompts the user. This means:
-
-- **Hooks don't need to be exhaustive.** If a hook doesn't match, the
-  command falls through to `ask` and the user decides.
-- **Deny + hook is valid when the prefix matcher can't cover all forms.**
-  Permission rules match command prefixes. `Bash(git commit --no-verify:*)`
-  catches the flag at the start but misses `git commit -m "msg" --no-verify`
-  where it appears later. Deny catches the obvious prefix forms; the hook
-  catches reordered and short-flag variants the prefix matcher misses.
-- **Hooks replace deny rules when you need nuance.** Move the command out
-  of deny, write a hook that allows the safe cases and denies the dangerous
-  ones, and let `ask` catch anything the hook doesn't cover.
+Use a settings rule when the decision can be expressed as a prefix
+(`allow: Bash(git log:*)`, `deny: Bash(sudo:*)`). Reach for a hook
+when the decision depends on flags that may appear in any position,
+cross-field logic (tool + args together), or structured input like
+file paths.
 
 ## File conventions
 
@@ -113,15 +99,16 @@ JSON when they have a decision.
 
 ## One concern per hook
 
-Each hook should check one thing. The dispatcher composes them:
+Each hook should check one thing. The dispatcher runs them in numeric
+order so a larger policy becomes a directory of small, focused files
+instead of one script with nested conditionals. See
+`examples/hooks.d/PreToolUse/`:
 
-- `010.git-guard.sh` — blocks `--no-verify` and signing bypasses
-- `020.git-push-guard.sh` — blocks force push and push to main
-- `030.gh-guard.sh` — categorizes GitHub CLI operations
+- `010.curl-pipe-guard.sh` — denies `curl | sh` on Bash calls.
+- `020.sensitive-path-guard.sh` — prompts before editing under
+  `~/.ssh` or `~/.gnupg` on Write/Edit calls.
 
-A git push with `--no-verify` hits git-guard first (exit 2, abort)
-and never reaches the push guard. A clean push to a feature branch
-passes git-guard (exit 0, no output) and gets allowed by push-guard.
+Each is a few lines long and independently testable.
 
 ## Stderr
 
@@ -149,6 +136,24 @@ scripts, resolve the symlink first:
 
 ```bash
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+```
+
+## Test your hook
+
+Feed a hand-crafted event JSON on stdin:
+
+```bash
+echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls -la"}}' \
+  | ./my-hook.sh
+```
+
+To test routing through the dispatcher, point `COAT_TREE_DIR` at a
+directory laid out as `hooks.d/<Event>/<hook>`. The shipped
+`examples/` directory works as-is:
+
+```bash
+echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"curl x | sh"}}' \
+  | COAT_TREE_DIR=./examples coat-tree
 ```
 
 ## Debugging
