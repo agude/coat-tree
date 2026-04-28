@@ -48,7 +48,9 @@ teardown() {
 echo hello'
     run run_dispatch '{"hook_event_name":"PreToolUse"}'
     [ "$status" -eq 0 ]
-    [ "$output" = "hello" ]
+    ctx=$(jq -r '.hookSpecificOutput.additionalContext' <<<"$output")
+    [[ "$ctx" == *"hello"* ]]
+    [[ "$ctx" == *'<hook source="010.echo.sh">'* ]]
 }
 
 @test "numeric ordering: 010 runs before 020" {
@@ -62,24 +64,29 @@ echo 020 >> '$log'"
     [ "$(cat "$log")" = "$(printf '010\n020')" ]
 }
 
-@test "output merging: last non-empty stdout wins" {
+@test "output merging: all hooks' outputs are aggregated" {
     make_hook PreToolUse "010.first.sh" '#!/usr/bin/env bash
 echo first'
     make_hook PreToolUse "020.second.sh" '#!/usr/bin/env bash
 echo second'
     run run_dispatch '{"hook_event_name":"PreToolUse"}'
     [ "$status" -eq 0 ]
-    [ "$output" = "second" ]
+    ctx=$(jq -r '.hookSpecificOutput.additionalContext' <<<"$output")
+    [[ "$ctx" == *"first"* ]]
+    [[ "$ctx" == *"second"* ]]
+    [[ "$ctx" == *'<hook source="010.first.sh">'* ]]
+    [[ "$ctx" == *'<hook source="020.second.sh">'* ]]
 }
 
-@test "output merging: empty output does not overwrite prior" {
+@test "output merging: silent hook contributes nothing" {
     make_hook PreToolUse "010.first.sh" '#!/usr/bin/env bash
 echo first'
     make_hook PreToolUse "020.silent.sh" '#!/usr/bin/env bash
 exit 0'
     run run_dispatch '{"hook_event_name":"PreToolUse"}'
     [ "$status" -eq 0 ]
-    [ "$output" = "first" ]
+    [[ "$output" == *"first"* ]]
+    [[ "$output" != *'020.silent.sh'* ]]
 }
 
 # --- exit code handling ---
@@ -116,7 +123,7 @@ echo ok"
 echo matched'
     run run_dispatch '{"hook_event_name":"PreToolUse","tool_name":"Bash"}'
     [ "$status" -eq 0 ]
-    [ "$output" = "matched" ]
+    [[ "$output" == *"matched"* ]]
 }
 
 @test "hook-matcher non-match: hook is skipped" {
@@ -134,7 +141,7 @@ echo should-not-run'
 echo matched'
     run run_dispatch '{"hook_event_name":"PreToolUse","tool_name":"Edit"}'
     [ "$status" -eq 0 ]
-    [ "$output" = "matched" ]
+    [[ "$output" == *"matched"* ]]
 }
 
 @test "absent matcher on tool event: hook runs" {
@@ -142,7 +149,7 @@ echo matched'
 echo ran'
     run run_dispatch '{"hook_event_name":"PreToolUse","tool_name":"AnyTool"}'
     [ "$status" -eq 0 ]
-    [ "$output" = "ran" ]
+    [[ "$output" == *"ran"* ]]
 }
 
 @test "non-tool event: hook-matcher header is ignored" {
@@ -151,7 +158,7 @@ echo ran'
 echo always'
     run run_dispatch '{"hook_event_name":"SessionStart"}'
     [ "$status" -eq 0 ]
-    [ "$output" = "always" ]
+    [[ "$output" == *"always"* ]]
 }
 
 # --- script filtering ---
@@ -184,4 +191,83 @@ echo always'
     run run_dispatch '{"hook_event_name":"PreToolUse"}'
     [ "$status" -eq 0 ]
     [ -z "$output" ]
+}
+
+# --- decision aggregation ---
+
+@test "PreToolUse: deny beats allow regardless of order" {
+    make_hook PreToolUse "010.allow.sh" '#!/usr/bin/env bash
+echo '\''{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"ok"}}'\'''
+    make_hook PreToolUse "020.deny.sh" '#!/usr/bin/env bash
+echo '\''{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"forbidden"}}'\'''
+    run run_dispatch '{"hook_event_name":"PreToolUse","tool_name":"Bash"}'
+    [ "$status" -eq 0 ]
+    decision=$(jq -r '.hookSpecificOutput.permissionDecision' <<<"$output")
+    [ "$decision" = "deny" ]
+    reason=$(jq -r '.hookSpecificOutput.permissionDecisionReason' <<<"$output")
+    [[ "$reason" == *"[010.allow.sh]"* ]]
+    [[ "$reason" == *"[020.deny.sh]"* ]]
+}
+
+@test "PreToolUse: ask beats allow" {
+    make_hook PreToolUse "010.allow.sh" '#!/usr/bin/env bash
+echo '\''{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'\'''
+    make_hook PreToolUse "020.ask.sh" '#!/usr/bin/env bash
+echo '\''{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}'\'''
+    run run_dispatch '{"hook_event_name":"PreToolUse","tool_name":"Bash"}'
+    [ "$status" -eq 0 ]
+    decision=$(jq -r '.hookSpecificOutput.permissionDecision' <<<"$output")
+    [ "$decision" = "ask" ]
+}
+
+@test "PreToolUse: deny beats ask" {
+    make_hook PreToolUse "010.ask.sh" '#!/usr/bin/env bash
+echo '\''{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}'\'''
+    make_hook PreToolUse "020.deny.sh" '#!/usr/bin/env bash
+echo '\''{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny"}}'\'''
+    run run_dispatch '{"hook_event_name":"PreToolUse","tool_name":"Bash"}'
+    [ "$status" -eq 0 ]
+    decision=$(jq -r '.hookSpecificOutput.permissionDecision' <<<"$output")
+    [ "$decision" = "deny" ]
+}
+
+@test "PreToolUse: additionalContext from multiple hooks is concatenated" {
+    make_hook PreToolUse "010.a.sh" '#!/usr/bin/env bash
+echo '\''{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"alpha"}}'\'''
+    make_hook PreToolUse "020.b.sh" '#!/usr/bin/env bash
+echo '\''{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"beta"}}'\'''
+    run run_dispatch '{"hook_event_name":"PreToolUse","tool_name":"Bash"}'
+    [ "$status" -eq 0 ]
+    ctx=$(jq -r '.hookSpecificOutput.additionalContext' <<<"$output")
+    [[ "$ctx" == *"alpha"* ]]
+    [[ "$ctx" == *"beta"* ]]
+    [[ "$ctx" == *'<hook source="010.a.sh">'* ]]
+    [[ "$ctx" == *'<hook source="020.b.sh">'* ]]
+}
+
+@test "SessionStart: outputs concatenated as plain text with source tags" {
+    make_hook SessionStart "010.knowledge.sh" '#!/usr/bin/env bash
+echo "knowledge content"'
+    make_hook SessionStart "020.wiki.sh" '#!/usr/bin/env bash
+echo "wiki content"'
+    run run_dispatch '{"hook_event_name":"SessionStart"}'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"knowledge content"* ]]
+    [[ "$output" == *"wiki content"* ]]
+    [[ "$output" == *'<hook source="010.knowledge.sh">'* ]]
+    [[ "$output" == *'<hook source="020.wiki.sh">'* ]]
+}
+
+@test "PostToolUse: any block decision propagates" {
+    make_hook PostToolUse "010.ok.sh" '#!/usr/bin/env bash
+echo "looks fine"'
+    make_hook PostToolUse "020.block.sh" '#!/usr/bin/env bash
+echo '\''{"decision":"block","reason":"violated policy"}'\'''
+    run run_dispatch '{"hook_event_name":"PostToolUse","tool_name":"Bash"}'
+    [ "$status" -eq 0 ]
+    decision=$(jq -r '.decision' <<<"$output")
+    [ "$decision" = "block" ]
+    reason=$(jq -r '.reason' <<<"$output")
+    [[ "$reason" == *"[020.block.sh]"* ]]
+    [[ "$reason" == *"violated policy"* ]]
 }

@@ -4,7 +4,18 @@
 #
 # All hook events in settings.json point here. The dispatcher reads
 # hook_event_name from stdin JSON, scans hooks.d/<event>/ for numbered
-# scripts, and runs them in order.
+# scripts, runs them in order, and aggregates their outputs into a
+# single response Claude Code accepts.
+#
+# Aggregation mirrors Claude Code's own multi-hook semantics:
+#   - PreToolUse: most-restrictive permissionDecision wins
+#     (deny > ask > allow). All additionalContext concatenated.
+#   - PostToolUse, Stop: any {"decision":"block"} blocks; otherwise
+#     plain text concatenated.
+#   - SessionStart, UserPromptSubmit: stdout / additionalContext
+#     concatenated as plain text injection.
+#   - SessionEnd, Notification: outputs are ignored by Claude Code
+#     anyway; scripts run for side effects.
 #
 # Note: Claude Code hooks share a 60-second timeout across the entire
 # invocation. The dispatcher does not enforce per-script timeouts —
@@ -71,9 +82,25 @@ if [[ ${#scripts[@]} -eq 0 ]]; then
     exit 0
 fi
 
-# --- Run scripts ---
-last_output=""
+# --- Aggregation state ---
+# Permission decision: most-restrictive wins. deny=3 > ask=2 > allow=1 > none=0
+decision_value=""
+decision_rank=0
+decision_reasons=""        # accumulated permissionDecisionReason (attributed)
+contexts=""                # accumulated additionalContext + plain text outputs
+block_present=0            # any script returned {"decision":"block"}
+block_reasons=""           # accumulated block reasons (attributed)
 
+rank_decision() {
+    case "$1" in
+        deny)  echo 3 ;;
+        ask)   echo 2 ;;
+        allow) echo 1 ;;
+        *)     echo 0 ;;
+    esac
+}
+
+# --- Run scripts ---
 for script in "${scripts[@]}"; do
     name="$(basename "$script")"
 
@@ -113,16 +140,86 @@ for script in "${scripts[@]}"; do
         log "$EVENT $name ok"
     fi
 
-    if [[ -n "$output" ]]; then
-        if [[ -n "$last_output" ]]; then
-            debug "warning: $name overwrites previous output"
+    [[ -z "$output" ]] && continue
+
+    # Recognize structured output: a JSON object containing either
+    # hookSpecificOutput (PreToolUse/UserPromptSubmit) or top-level
+    # decision (PostToolUse/Stop). Anything else is plain text.
+    if echo "$output" | jq -e 'type == "object" and ((.hookSpecificOutput // .decision) != null)' >/dev/null 2>&1; then
+        decision=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
+        reason=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecisionReason // empty' 2>/dev/null)
+        ctx=$(echo "$output" | jq -r '.hookSpecificOutput.additionalContext // empty' 2>/dev/null)
+        block_decision=$(echo "$output" | jq -r '.decision // empty' 2>/dev/null)
+        block_reason=$(echo "$output" | jq -r '.reason // empty' 2>/dev/null)
+
+        if [[ -n "$decision" ]]; then
+            new_rank=$(rank_decision "$decision")
+            if (( new_rank > decision_rank )); then
+                decision_rank=$new_rank
+                decision_value="$decision"
+            fi
+            if [[ -n "$reason" ]]; then
+                decision_reasons+="[$name] $reason"$'\n'
+            fi
         fi
-        last_output="$output"
-        debug "$name produced output (${#output} bytes)"
+        if [[ -n "$ctx" ]]; then
+            contexts+="<hook source=\"$name\">"$'\n'"$ctx"$'\n'"</hook>"$'\n'
+        fi
+        if [[ "$block_decision" == "block" ]]; then
+            block_present=1
+            if [[ -n "$block_reason" ]]; then
+                block_reasons+="[$name] $block_reason"$'\n'
+            fi
+        fi
+    else
+        contexts+="<hook source=\"$name\">"$'\n'"$output"$'\n'"</hook>"$'\n'
     fi
+    debug "$name produced output (${#output} bytes)"
 done
 
-# Emit the last non-empty stdout
-if [[ -n "$last_output" ]]; then
-    printf '%s\n' "$last_output"
-fi
+# --- Emit aggregated output ---
+
+# Strip trailing whitespace/newlines for clean output
+# shellcheck disable=SC2001  # sed is cleaner than extglob for multi-line strings
+strip() { sed -e 's/[[:space:]]*$//' <<< "$1"; }
+
+contexts="$(strip "$contexts")"
+decision_reasons="$(strip "$decision_reasons")"
+block_reasons="$(strip "$block_reasons")"
+
+case "$EVENT" in
+    PreToolUse)
+        if [[ -n "$decision_value" ]] || [[ -n "$contexts" ]]; then
+            jq -n \
+                --arg event "$EVENT" \
+                --arg decision "$decision_value" \
+                --arg reason "$decision_reasons" \
+                --arg ctx "$contexts" \
+                '{
+                    hookSpecificOutput: (
+                        {hookEventName: $event}
+                        + (if $decision != "" then {permissionDecision: $decision} else {} end)
+                        + (if $reason   != "" then {permissionDecisionReason: $reason} else {} end)
+                        + (if $ctx      != "" then {additionalContext: $ctx} else {} end)
+                    )
+                }'
+        fi
+        ;;
+    PostToolUse|Stop)
+        if (( block_present )); then
+            jq -n --arg reason "$block_reasons" '{decision: "block", reason: $reason}'
+        elif [[ -n "$contexts" ]]; then
+            printf '%s\n' "$contexts"
+        fi
+        ;;
+    *)
+        # SessionStart, UserPromptSubmit, SessionEnd, Notification, others.
+        # Plain-text concatenation. (UserPromptSubmit also accepts plain
+        # text per docs; SessionEnd/Notification outputs are ignored.)
+        if [[ -n "$contexts" ]]; then
+            printf '%s\n' "$contexts"
+        fi
+        ;;
+esac
+
+exit 0
